@@ -14,13 +14,24 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
-from huggingface_hub.utils._errors import RepositoryNotFoundError
+try:
+    # Prefer public API
+    from huggingface_hub.errors import RepositoryNotFoundError
+except Exception:
+    try:
+        # Older versions exposed this in utils
+        from huggingface_hub.utils import RepositoryNotFoundError
+    except Exception:
+        # Fallback to a local definition if not available
+        class RepositoryNotFoundError(Exception):
+            pass
 from mlx.utils import tree_flatten
 from transformers import PreTrainedTokenizer
 
 # mlx_lm
 from mlx_lm.tokenizer_utils import TokenizerWrapper, load_tokenizer
-from mlx_lm.tuner.utils import apply_lora_layers
+# Note: tuner utils API changed in recent mlx_lm versions. Import lazily below.
+# Keep dequantize import, which remains stable.
 from mlx_lm.tuner.utils import dequantize as dequantize_model
 
 # Local imports
@@ -40,6 +51,97 @@ class ModelNotFoundError(Exception):
     def __init__(self, message):
         self.message = message
         super().__init__(self.message)
+
+
+def load_mmlu_pro_prompts(
+    num_prompts: int,
+    split: str = "test",
+    subjects: Optional[List[str]] = None,
+    seed: Optional[int] = None,
+    instruction: Optional[str] = None,
+) -> List[str]:
+    """Load prompts from TIGER-Lab/MMLU-Pro and format them.
+
+    This uses the Hugging Face `datasets` library. It samples `num_prompts`
+    examples (shuffled deterministically with `seed` if provided) and returns
+    formatted prompts suitable for `batch_generate`.
+
+    Args:
+        num_prompts: Number of prompts to sample.
+        split: Dataset split to use, e.g. "test".
+        subjects: Optional list of subject names to filter by.
+        seed: Optional RNG seed for deterministic sampling.
+        instruction: Optional instruction prefix to include before questions.
+
+    Returns:
+        List[str]: A list of formatted prompt strings.
+    """
+    try:
+        from datasets import load_dataset  # type: ignore
+    except Exception as e:
+        raise ImportError(
+            "The 'datasets' package is required to load MMLU-Pro. "
+            "Install it via `pip install datasets`."
+        ) from e
+
+    ds = load_dataset("TIGER-Lab/MMLU-Pro", split=split)
+
+    if subjects:
+        subjects_set = set(subjects)
+        ds = ds.filter(lambda x: x.get("subject") in subjects_set)
+
+    if seed is not None:
+        ds = ds.shuffle(seed=seed)
+    else:
+        ds = ds.shuffle()
+
+    take_n = min(num_prompts, len(ds))
+    ds = ds.select(range(take_n))
+
+    prompts: List[str] = []
+    default_instruction = (
+        "You are an expert at multiple-choice questions. "
+        "Choose the single best answer."
+    )
+    prefix = instruction or default_instruction
+
+    for ex in ds:
+        question = (
+            ex.get("question")
+            or ex.get("query")
+            or ex.get("prompt")
+            or ""
+        )
+        options = ex.get("options") or ex.get("choices") or []
+
+        if isinstance(options, dict):
+            # Some datasets store choices as a dict mapping labels to text
+            # Normalize to a list ordered by label where possible
+            ordered = []
+            for i in range(len(options)):
+                label = chr(65 + i)
+                if label in options:
+                    ordered.append(options[label])
+            if not ordered:  # fallback to values order
+                ordered = list(options.values())
+            options = ordered
+
+        if options:
+            opts_text = "\n".join(
+                f"{chr(65 + i)}. {str(opt)}" for i, opt in enumerate(options)
+            )
+            prompt = (
+                f"{prefix}\n"
+                f"Question: {question}\n"
+                f"Options:\n{opts_text}\n"
+                f"Answer with only the letter (A, B, C, ...)."
+            )
+        else:
+            prompt = f"{prefix}\nQuestion: {question}"
+
+        prompts.append(prompt)
+
+    return prompts
 
 
 def _get_classes(config: dict):
@@ -105,28 +207,66 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
     return model_path
 
 
-def apply_repetition_penalty(logits: mx.array, generated_tokens: Any, penalty: float):
+def apply_repetition_penalty(logits: mx.array, generated_tokens: Any, penalty: float) -> mx.array:
     """
-    Apply repetition penalty to specific logits based on the given context.
+    Apply a repetition penalty per batch row to discourage repeating tokens seen
+    in the given context.
 
     Paper: https://arxiv.org/abs/1909.05858
 
     Args:
-        logits (mx.array): The logits produced by the language model.
-        generated_tokens (any): A list of N previous tokens.
-        penalty (float): The repetition penalty factor to be applied.
+        logits: [batch, vocab] logits for the next token.
+        generated_tokens: Either a 1D sequence of token ids or a 2D array of
+            shape [batch, seq] containing the recent context per batch row.
+        penalty: Penalty factor (> 1.0 to discourage repetition).
 
     Returns:
-        logits (mx.array): Logits with repetition penalty applied to generated tokens.
+        Logits with the penalty applied in-place and also returned.
     """
+    # Fast path: nothing to do
+    if generated_tokens is None:
+        return logits
 
-    if len(generated_tokens) > 0:
-        indices = mx.array([token for token in generated_tokens])
-        selected_logits = logits[:, indices]
-        selected_logits = mx.where(
-            selected_logits < 0, selected_logits * penalty, selected_logits / penalty
-        )
-        logits[:, indices] = selected_logits
+    # Helper to apply on a set of token indices for a specific row slice
+    def _apply_row(row_slice: slice, tok_ids: list[int]):
+        if not tok_ids:
+            return
+        unique_ids = list(set(int(t) for t in tok_ids))
+        idx = mx.array(unique_ids)
+        sel = logits[row_slice, idx]
+        sel = mx.where(sel < 0, sel * penalty, sel / penalty)
+        logits[row_slice, idx] = sel
+
+    # Handle different container shapes for generated_tokens
+    try:
+        shape = getattr(generated_tokens, "shape", None)
+        if shape is not None:
+            # MX array path
+            if len(shape) == 2:
+                bsz = shape[0]
+                for b in range(bsz):
+                    _apply_row(slice(b, b + 1), generated_tokens[b].tolist())
+            elif len(shape) == 1:
+                # Same set for all rows
+                _apply_row(slice(None), generated_tokens.tolist())
+            else:
+                # Unknown higher dims: flatten
+                _apply_row(slice(None), mx.ravel(generated_tokens).tolist())
+        else:
+            # Python container
+            if isinstance(generated_tokens[0], (list, tuple)):
+                for b, row in enumerate(generated_tokens):
+                    _apply_row(slice(b, b + 1), list(row))
+            else:
+                _apply_row(slice(None), list(generated_tokens))
+    except Exception:
+        # Fallback: best-effort on flattened content
+        try:
+            flat = list(generated_tokens)
+        except Exception:
+            return logits
+        _apply_row(slice(None), flat)
+
     return logits
 
 
@@ -180,9 +320,6 @@ def generate_step(
         probs = softmax_logits[0, tokens]
         return tokens, probs
 
-    if repetition_penalty:
-        raise NotImplementedError("repetition_penalty not supported.")
-
     if repetition_penalty and (
         repetition_penalty < 0 or not isinstance(repetition_penalty, float)
     ):
@@ -211,13 +348,10 @@ def generate_step(
         logits = logits[:, -1, :]
 
         if repetition_penalty:
-            logits = apply_repetition_penalty(
-                logits, repetition_context, repetition_penalty
-            )
-            y, probs = sample(logits)
-            repetition_context = mx.concatenate([repetition_context, y])
-        else:
-            y, probs = sample(logits)
+            logits = apply_repetition_penalty(logits, repetition_context, repetition_penalty)
+        y, probs = sample(logits)
+        if repetition_penalty:
+            repetition_context = mx.concatenate([repetition_context, y], axis=1)
 
         if repetition_context_size:
             if repetition_context.shape[1] > repetition_context_size:
@@ -280,8 +414,11 @@ def batch_generate(
     prompts: List[str],
     max_tokens: int = 100,
     verbose: bool = False,
+    show_text: bool = True,
     format_prompts: bool = True,
     formatter: Optional[Callable] = None,
+    stats: Optional[Dict[str, float]] = None,
+    run_label: Optional[str] = None,
     **kwargs,
 ) -> Union[str, Generator[str, None, None]]:
     """
@@ -292,19 +429,26 @@ def batch_generate(
        tokenizer (PreTrainedTokenizer): The tokenizer.
        prompt (str): The string prompt.
        max_tokens (int): The maximum number of tokens. Default: ``100``.
-       verbose (bool): If ``True``, print tokens and timing information.
+       verbose (bool): If ``True``, print timing information and, if
+           ``show_text`` is also ``True``, the prompts and generations.
            Default: ``False``.
+       show_text (bool): When ``verbose=True``, controls whether to print the
+           prompts and generated text. Default: ``True``.
        formatter (Optional[Callable]): A function which takes a token and a
            probability and displays it.
+       stats (Optional[Dict[str, float]]): If provided, accumulates timing and
+           token count metrics into this dictionary across calls. Keys used:
+           'prompt_time', 'gen_time', 'prompt_tokens', 'gen_tokens',
+           'prompts', 'batches'.
+       run_label (Optional[str]): A label to print with metrics (e.g., model id).
        kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
     """
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
 
-    if verbose:
-        print("=" * 10)
-    
+    # verbose banner removed from the beginning; we'll print details after results
+
     if format_prompts:
         prompts_fm = [[{"role": "user", "content": prompt}] for prompt in prompts]
         prompts_fm = [tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=False) for prompt in prompts_fm]
@@ -333,16 +477,39 @@ def batch_generate(
 
     # detokenizing + stripping pad/eos tokens
     responses = [response.split(tokenizer.eos_token)[0].split(tokenizer.pad_token)[0] for response in tokenizer.batch_decode(output_toks.tolist())]
+    # Compute metrics regardless of verbosity (for optional aggregation)
+    gen_time = time.perf_counter() - tic
+    prompt_tokens_count = int(prompts_toks.size)
+    gen_tokens_count = int(output_toks.size)
+
+    # Accumulate stats if requested
+    if stats is not None:
+        stats["prompt_time"] = stats.get("prompt_time", 0.0) + float(prompt_time)
+        stats["gen_time"] = stats.get("gen_time", 0.0) + float(gen_time)
+        stats["prompt_tokens"] = stats.get("prompt_tokens", 0) + int(prompt_tokens_count)
+        stats["gen_tokens"] = stats.get("gen_tokens", 0) + int(gen_tokens_count)
+        stats["prompts"] = stats.get("prompts", 0) + int(len(prompts))
+        stats["batches"] = stats.get("batches", 0) + 1
+
     if verbose:
-        gen_time = time.perf_counter() - tic
-        prompt_tps = prompts_toks.size / prompt_time
-        gen_tps = output_toks.size / gen_time
+        # Optionally print prompts and generations first
+        if show_text:
+            for prompt, response in zip(prompts, responses):
+                print("=" * 10)
+                print("Prompt:", prompt)
+                print(response)
+        # Then print speed metrics at the end
+        prompt_tps = prompt_tokens_count / prompt_time
+        gen_tps = gen_tokens_count / gen_time
+        print("=" * 10)
+        if run_label:
+            print(f"Model: {run_label}")
         print(f"Prompt: {prompt_tps:.3f} tokens-per-sec")
         print(f"Generation: {gen_tps:.3f} tokens-per-sec")
-        for prompt, response in zip(prompts, responses):
-            print("=" * 10)
-            print("Prompt:", prompt)
-            print(response)
+        total_elapsed = prompt_time + gen_time
+        avg_elapsed = total_elapsed / max(1, len(prompts))
+        print(f"Total elapsed time: {total_elapsed:.3f}s")
+        print(f"Average total elapsed time per prompt: {avg_elapsed:.3f}s")
             
     return responses
 
@@ -416,6 +583,7 @@ def generate(
         gen_tps = (token_count - 1) / gen_time
         print(f"Prompt: {prompt_tps:.3f} tokens-per-sec")
         print(f"Generation: {gen_tps:.3f} tokens-per-sec")
+        print(f"Total elapsed time: {prompt_time + gen_time:.3f}s")
 
     return detokenizer.text
 
@@ -480,15 +648,39 @@ def load_model(
         weights = model.sanitize(weights)
 
     if (quantization := config.get("quantization", None)) is not None:
-        # Handle legacy models which may not have everything quantized
-        def class_predicate(p, m):
-            if not hasattr(m, "to_quantized"):
+        # Handle quantization configs which may include per-module overrides.
+        # Expected base keys: group_size, bits. Optional overrides: path -> {group_size, bits}.
+        base_group_size = quantization.get("group_size", 64)
+        base_bits = quantization.get("bits", 4)
+
+        # Build override map from quantization config for specific module paths
+        override_map = {
+            k: v
+            for k, v in quantization.items()
+            if isinstance(v, dict) and ("group_size" in v or "bits" in v)
+        }
+
+        # Only quantize modules that (a) support to_quantized and (b) have quantized tensors in weights
+        def class_predicate(path, module):
+            if not hasattr(module, "to_quantized"):
                 return False
-            return f"{p}.scales" in weights
+            # Ensure corresponding quantized weights exist in files
+            has_quant = f"{path}.scales" in weights
+            if not has_quant:
+                return False
+            # Provide per-path overrides if present
+            if path in override_map:
+                ov = override_map[path]
+                return {
+                    "group_size": ov.get("group_size", base_group_size),
+                    "bits": ov.get("bits", base_bits),
+                }
+            return True
 
         nn.quantize(
             model,
-            **quantization,
+            group_size=base_group_size,
+            bits=base_bits,
             class_predicate=class_predicate,
         )
 
@@ -533,7 +725,19 @@ def load(
 
     model = load_model(model_path, lazy, model_config)
     if adapter_path is not None:
-        model = apply_lora_layers(model, adapter_path)
+        # mlx_lm renamed apply_lora_layers -> load_adapters. Prefer new API,
+        # fall back to the old name for backward compatibility.
+        try:
+            from mlx_lm.tuner.utils import load_adapters as _load_adapters  # type: ignore
+        except Exception:
+            try:
+                from mlx_lm.tuner.utils import apply_lora_layers as _load_adapters  # type: ignore
+            except Exception as e:
+                raise ImportError(
+                    "LoRA adapter loading API not found in mlx_lm. "
+                    "Please upgrade mlx_lm or remove adapter_path."
+                ) from e
+        model = _load_adapters(model, adapter_path)
         model.eval()
     tokenizer = load_tokenizer(model_path, tokenizer_config)
 

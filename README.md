@@ -12,7 +12,7 @@ Requires `mlx` and `mlx_lm` to be installed.
 from mlx_parallm.utils import load, batch_generate
 model, tokenizer = load("google/gemma-1.1-2b-it")
 prompts = ["prompt_0", ..., "prompt_k"]
-responses = batch_generate(model, tokenizer, prompts=prompts_raw[:10], max_tokens=100, verbose=True, format_prompts=True, temp=0.0)
+responses = batch_generate(model, tokenizer, prompts=prompts[:10], max_tokens=100, verbose=True, format_prompts=True, temp=0.0)
 ```
 
 ## Models
@@ -41,3 +41,19 @@ Not (yet) supported:
 - Repetition penalties
 - Streaming outputs for `batch_generate`
 - Dynamic batching for async requests
+
+## MMLU-Pro Prompts
+Optionally use prompts from the TIGER-Lab/MMLU-Pro dataset (requires the `datasets` package):
+
+```
+pip install datasets
+python main.py --mmlu-pro --num-prompts 20 --mmlu-split test
+```
+
+You can also load prompts programmatically via `load_mmlu_pro_prompts(num_prompts, split, subjects=None, seed=None)` in `mlx_parallm.utils`.
+
+### Benchmarking and smart batching
+- Only print final speed/time metrics (no text output):
+  - `python main.py --benchmark --num-prompts 50`
+- Group prompts into similar-length batches to reduce padding:
+  - `python main.py --batch-size 10 --num-prompts 50`

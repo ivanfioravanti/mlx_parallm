@@ -1,2 +1,4 @@
 mlx
 mlx_lm
+huggingface_hub>=0.24.0
+datasets>=2.18.0
